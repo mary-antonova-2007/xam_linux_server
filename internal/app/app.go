@@ -9,6 +9,7 @@ import (
 
 	"xam/linux_server/internal/auth"
 	"xam/linux_server/internal/config"
+	"xam/linux_server/internal/debuglog"
 	"xam/linux_server/internal/httpapi"
 	"xam/linux_server/internal/objectstore"
 	"xam/linux_server/internal/service"
@@ -43,8 +44,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 
 	tokens := auth.NewTokenManager(cfg.JWTSecret, cfg.TokenTTL)
-	svc := service.New(cfg, store, objects, tokens, logger)
-	server := httpapi.New(cfg, logger, svc, tokens)
+	logbook := debuglog.New(cfg.DebugLogBuffer)
+	svc := service.New(cfg, store, objects, tokens, logger, logbook)
+	server := httpapi.New(cfg, logger, svc, tokens, logbook)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go svc.RunCleanupLoop(ctx)

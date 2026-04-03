@@ -31,6 +31,8 @@ type Config struct {
 	S3UseSSL           bool
 	PresignTTL         time.Duration
 	LogLevel           slog.Level
+	DebugAPIEnabled    bool
+	DebugLogBuffer     int
 }
 
 func Load() (Config, error) {
@@ -57,6 +59,8 @@ func Load() (Config, error) {
 		S3UseSSL:           getBoolEnv("S3_USE_SSL", false),
 		PresignTTL:         getDurationEnv("PRESIGN_TTL", 15*time.Minute),
 		LogLevel:           getLogLevel(getEnv("LOG_LEVEL", "INFO")),
+		DebugAPIEnabled:    getBoolEnv("DEBUG_API_ENABLED", false),
+		DebugLogBuffer:     getIntEnv("DEBUG_LOG_BUFFER", 500),
 	}
 
 	if cfg.JWTSecret == "" {

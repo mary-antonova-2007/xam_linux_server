@@ -203,7 +203,7 @@ func newTestService(t *testing.T) (*Service, ed25519.PrivateKey, domain.Device) 
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	tokens := auth.NewTokenManager("test-secret", cfg.TokenTTL)
-	svc := New(cfg, store, &fakeObjectStore{}, tokens, logger)
+	svc := New(cfg, store, &fakeObjectStore{}, tokens, logger, nil)
 	device, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{
 		AuthPublicKey:     authKey,
 		ExchangePublicKey: exchangeKey,

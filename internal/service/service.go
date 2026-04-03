@@ -16,6 +16,7 @@ import (
 
 	"xam/linux_server/internal/auth"
 	"xam/linux_server/internal/config"
+	"xam/linux_server/internal/debuglog"
 	"xam/linux_server/internal/domain"
 	"xam/linux_server/internal/storage"
 )
@@ -66,6 +67,7 @@ type Service struct {
 	objects ObjectStore
 	tokens  *auth.TokenManager
 	logger  *slog.Logger
+	logbook *debuglog.LogBook
 	now     Clock
 }
 
@@ -97,13 +99,14 @@ type UploadInitInput struct {
 	MIMEType       string `json:"mime_type"`
 }
 
-func New(cfg config.Config, store Store, objects ObjectStore, tokens *auth.TokenManager, logger *slog.Logger) *Service {
+func New(cfg config.Config, store Store, objects ObjectStore, tokens *auth.TokenManager, logger *slog.Logger, logbook *debuglog.LogBook) *Service {
 	return &Service{
 		cfg:     cfg,
 		store:   store,
 		objects: objects,
 		tokens:  tokens,
 		logger:  logger,
+		logbook: logbook,
 		now:     time.Now,
 	}
 }
@@ -120,6 +123,11 @@ func (s *Service) RegisterDevice(ctx context.Context, input RegisterDeviceInput)
 	if err != nil {
 		return domain.Device{}, err
 	}
+	s.logEvent(slog.LevelInfo, "device registered", map[string]any{
+		"device_id":           device.ID,
+		"auth_public_key_len": len(input.AuthPublicKey),
+		"exchange_public_len": len(input.ExchangePublicKey),
+	})
 	return device, nil
 }
 
@@ -146,6 +154,11 @@ func (s *Service) CreateChallenge(ctx context.Context, input CreateChallengeInpu
 	if err := s.store.CreateChallenge(ctx, challenge); err != nil {
 		return domain.AuthChallenge{}, err
 	}
+	s.logEvent(slog.LevelInfo, "auth challenge created", map[string]any{
+		"device_id":    device.ID,
+		"challenge_id": challenge.ID,
+		"expires_at":   challenge.ExpiresAt,
+	})
 	return challenge, nil
 }
 
@@ -194,6 +207,10 @@ func (s *Service) VerifyChallenge(ctx context.Context, input VerifyChallengeInpu
 	if err != nil {
 		return "", time.Time{}, "", err
 	}
+	s.logEvent(slog.LevelInfo, "auth verified", map[string]any{
+		"device_id":  device.ID,
+		"expires_at": expiresAt,
+	})
 	return token, expiresAt, device.ID, nil
 }
 
@@ -244,7 +261,20 @@ func (s *Service) SendMessage(ctx context.Context, senderDeviceID string, input 
 		CreatedAt:         now,
 		ExpiresAt:         now.Add(s.cfg.MessageTTL),
 	}
-	return s.store.CreateMessage(ctx, message)
+	created, err := s.store.CreateMessage(ctx, message)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	s.logEvent(slog.LevelInfo, "message stored", map[string]any{
+		"message_id":           created.ID,
+		"sender_device_id":     senderDeviceID,
+		"recipient_device_id":  input.RecipientDeviceID,
+		"message_type":         input.MessageType,
+		"ciphertext_length":    len(input.Ciphertext),
+		"has_attachment":       input.AttachmentID != nil,
+		"idempotency_key_size": len(input.IdempotencyKey),
+	})
+	return created, nil
 }
 
 func (s *Service) PullMessages(ctx context.Context, deviceID string, limit int) ([]domain.Message, error) {
@@ -257,14 +287,32 @@ func (s *Service) PullMessages(ctx context.Context, deviceID string, limit int) 
 	if err := s.store.TouchDevice(ctx, deviceID, s.now().UTC()); err != nil {
 		return nil, err
 	}
-	return s.store.PullMessages(ctx, deviceID, limit, s.now().UTC())
+	messages, err := s.store.PullMessages(ctx, deviceID, limit, s.now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	s.logEvent(slog.LevelInfo, "messages pulled", map[string]any{
+		"device_id": deviceID,
+		"limit":     limit,
+		"count":     len(messages),
+	})
+	return messages, nil
 }
 
 func (s *Service) AckDeleteMessages(ctx context.Context, deviceID string, messageIDs []string) (int64, error) {
 	if len(messageIDs) == 0 || len(messageIDs) > s.cfg.MaxACKItems {
 		return 0, fmt.Errorf("%w: invalid ack payload", ErrInvalidInput)
 	}
-	return s.store.AckDeleteMessages(ctx, deviceID, messageIDs)
+	deleted, err := s.store.AckDeleteMessages(ctx, deviceID, messageIDs)
+	if err != nil {
+		return 0, err
+	}
+	s.logEvent(slog.LevelInfo, "messages acknowledged", map[string]any{
+		"device_id":     deviceID,
+		"requested_ids": len(messageIDs),
+		"deleted_count": deleted,
+	})
+	return deleted, nil
 }
 
 func (s *Service) InitAttachmentUpload(ctx context.Context, deviceID string, input UploadInitInput) (domain.Attachment, string, error) {
@@ -295,6 +343,12 @@ func (s *Service) InitAttachmentUpload(ctx context.Context, deviceID string, inp
 	if err != nil {
 		return domain.Attachment{}, "", err
 	}
+	s.logEvent(slog.LevelInfo, "attachment upload initialized", map[string]any{
+		"device_id":       deviceID,
+		"attachment_id":   attachment.ID,
+		"ciphertext_size": attachment.CiphertextSize,
+		"mime_type":       attachment.MIMEType,
+	})
 	return attachment, url.String(), nil
 }
 
@@ -317,7 +371,10 @@ func (s *Service) AttachmentDownloadURL(ctx context.Context, deviceID, attachmen
 	if err != nil {
 		return domain.Attachment{}, "", err
 	}
-	_ = deviceID
+	s.logEvent(slog.LevelInfo, "attachment download issued", map[string]any{
+		"device_id":     deviceID,
+		"attachment_id": attachmentID,
+	})
 	return attachment, url.String(), nil
 }
 
@@ -369,6 +426,73 @@ func (s *Service) Health(ctx context.Context) error {
 		return nil
 	}
 	return s.objects.Health(ctx)
+}
+
+func (s *Service) EnsureDebugDevice(ctx context.Context, publicKey string) (domain.Device, bool, error) {
+	if err := validateBase64Key(publicKey); err != nil {
+		return domain.Device{}, false, fmt.Errorf("%w: invalid public key", ErrInvalidInput)
+	}
+
+	device, err := s.store.GetDeviceByAuthKey(ctx, publicKey)
+	if err == nil {
+		s.logEvent(slog.LevelInfo, "debug device reused", map[string]any{
+			"device_id": device.ID,
+		})
+		return device, false, nil
+	}
+	if !errors.Is(err, storage.ErrNotFound) {
+		return domain.Device{}, false, err
+	}
+
+	device, err = s.store.CreateDevice(ctx, publicKey, publicKey, s.now().UTC())
+	if err != nil {
+		return domain.Device{}, false, err
+	}
+	s.logEvent(slog.LevelWarn, "debug device auto-registered", map[string]any{
+		"device_id": device.ID,
+	})
+	return device, true, nil
+}
+
+func (s *Service) ResolveDeviceByPublicKey(ctx context.Context, publicKey string) (domain.Device, error) {
+	if err := validateBase64Key(publicKey); err != nil {
+		return domain.Device{}, fmt.Errorf("%w: invalid public key", ErrInvalidInput)
+	}
+	return s.store.GetDeviceByAuthKey(ctx, publicKey)
+}
+
+func (s *Service) IssueDebugToken(ctx context.Context, deviceID string) (string, time.Time, error) {
+	now := s.now().UTC()
+	if err := s.store.TouchDevice(ctx, deviceID, now); err != nil {
+		return "", time.Time{}, err
+	}
+	token, expiresAt, err := s.tokens.Issue(deviceID, now)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	s.logEvent(slog.LevelWarn, "debug token issued", map[string]any{
+		"device_id":  deviceID,
+		"expires_at": expiresAt,
+	})
+	return token, expiresAt, nil
+}
+
+func (s *Service) logEvent(level slog.Level, message string, fields map[string]any) {
+	args := make([]any, 0, len(fields)*2)
+	for key, value := range fields {
+		args = append(args, key, value)
+	}
+	switch {
+	case level >= slog.LevelError:
+		s.logger.Error(message, args...)
+	case level >= slog.LevelWarn:
+		s.logger.Warn(message, args...)
+	default:
+		s.logger.Info(message, args...)
+	}
+	if s.logbook != nil {
+		s.logbook.Add(level, message, fields)
+	}
 }
 
 func validateBase64Key(value string) error {

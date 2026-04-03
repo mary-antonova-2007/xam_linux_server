@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"xam/linux_server/internal/auth"
 	"xam/linux_server/internal/config"
+	"xam/linux_server/internal/debuglog"
 	"xam/linux_server/internal/ratelimit"
 	"xam/linux_server/internal/service"
 	"xam/linux_server/internal/storage"
@@ -20,23 +22,26 @@ import (
 type ctxKey string
 
 const deviceIDKey ctxKey = "deviceID"
+const requestIDKey ctxKey = "requestID"
 
 type Server struct {
 	cfg         config.Config
 	logger      *slog.Logger
 	service     *service.Service
 	tokens      *auth.TokenManager
+	logbook     *debuglog.LogBook
 	authLimiter *ratelimit.Limiter
 	sendLimiter *ratelimit.Limiter
 	pullLimiter *ratelimit.Limiter
 }
 
-func New(cfg config.Config, logger *slog.Logger, svc *service.Service, tokens *auth.TokenManager) *Server {
+func New(cfg config.Config, logger *slog.Logger, svc *service.Service, tokens *auth.TokenManager, logbook *debuglog.LogBook) *Server {
 	return &Server{
 		cfg:         cfg,
 		logger:      logger,
 		service:     svc,
 		tokens:      tokens,
+		logbook:     logbook,
 		authLimiter: ratelimit.New(cfg.AuthRatePerMinute, time.Minute),
 		sendLimiter: ratelimit.New(cfg.SendRatePerMinute, time.Minute),
 		pullLimiter: ratelimit.New(cfg.PullRatePerMinute, time.Minute),
@@ -55,6 +60,11 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("POST /messages/ack-delete", s.withAuth(s.handleAckDelete))
 	mux.Handle("POST /attachments/upload-init", s.withAuth(s.handleUploadInit))
 	mux.Handle("GET /attachments/download", s.withAuth(s.handleDownloadAttachment))
+	if s.cfg.DebugAPIEnabled {
+		mux.HandleFunc("POST /debug/bootstrap", s.handleDebugBootstrap)
+		mux.HandleFunc("POST /debug/resolve-device", s.handleDebugResolveDevice)
+		mux.HandleFunc("GET /debug/logs", s.handleDebugLogs)
+	}
 
 	return s.withRequestID(s.withLogging(mux))
 }
@@ -229,6 +239,76 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 	})
 }
 
+func (s *Server) handleDebugBootstrap(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DebugAPIEnabled {
+		s.writeError(w, http.StatusNotFound, errors.New("debug api is disabled"))
+		return
+	}
+	var payload struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	device, created, err := s.service.EnsureDebugDevice(r.Context(), payload.PublicKey)
+	if err != nil {
+		s.writeServiceError(w, err)
+		return
+	}
+	token, expiresAt, err := s.service.IssueDebugToken(r.Context(), device.ID)
+	if err != nil {
+		s.writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"device_id":     device.ID,
+		"access_token":  token,
+		"expires_at":    expiresAt,
+		"created":       created,
+		"debug_enabled": true,
+	})
+}
+
+func (s *Server) handleDebugResolveDevice(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DebugAPIEnabled {
+		s.writeError(w, http.StatusNotFound, errors.New("debug api is disabled"))
+		return
+	}
+	var payload struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	device, err := s.service.ResolveDeviceByPublicKey(r.Context(), payload.PublicKey)
+	if err != nil {
+		s.writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"device_id": device.ID,
+		"status":    device.Status,
+	})
+}
+
+func (s *Server) handleDebugLogs(w http.ResponseWriter, r *http.Request) {
+	if !s.cfg.DebugAPIEnabled {
+		s.writeError(w, http.StatusNotFound, errors.New("debug api is disabled"))
+		return
+	}
+	limit := 200
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": s.logbook.List(limit),
+	})
+}
+
 func (s *Server) withAuth(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -254,20 +334,38 @@ func (s *Server) withRequestID(next http.Handler) http.Handler {
 			requestID = strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "")
 		}
 		w.Header().Set("X-Request-ID", requestID)
-		next.ServeHTTP(w, r)
+		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 func (s *Server) withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		next.ServeHTTP(w, r)
-		s.logger.Info("http request",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"remote_addr", r.RemoteAddr,
-			"duration_ms", time.Since(start).Milliseconds(),
-		)
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(recorder, r)
+
+		fields := map[string]any{
+			"request_id":    requestIDFromContext(r.Context()),
+			"method":        r.Method,
+			"path":          r.URL.Path,
+			"query":         r.URL.RawQuery,
+			"remote_addr":   r.RemoteAddr,
+			"user_agent":    r.UserAgent(),
+			"status":        recorder.status,
+			"bytes":         recorder.bytes,
+			"duration_ms":   time.Since(start).Milliseconds(),
+			"device_id":     deviceIDFromContext(r.Context()),
+			"forwarded_for": r.Header.Get("X-Forwarded-For"),
+		}
+		args := make([]any, 0, len(fields)*2)
+		for key, value := range fields {
+			args = append(args, key, value)
+		}
+		s.logger.Info("http request", args...)
+		if s.logbook != nil {
+			s.logbook.Add(slog.LevelInfo, "http request", fields)
+		}
 	})
 }
 
@@ -301,10 +399,32 @@ func deviceIDFromContext(ctx context.Context) string {
 	return value
 }
 
+func requestIDFromContext(ctx context.Context) string {
+	value, _ := ctx.Value(requestIDKey).(string)
+	return value
+}
+
 func clientKey(r *http.Request) string {
 	host := r.Header.Get("X-Forwarded-For")
 	if host != "" {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Write(payload []byte) (int, error) {
+	size, err := r.ResponseWriter.Write(payload)
+	r.bytes += size
+	return size, err
 }
