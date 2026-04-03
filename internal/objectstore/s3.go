@@ -3,6 +3,7 @@ package objectstore
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"time"
 
@@ -49,6 +50,25 @@ func (c *Client) PresignedPut(ctx context.Context, objectKey string, mimeType st
 
 func (c *Client) PresignedGet(ctx context.Context, objectKey string) (*url.URL, error) {
 	return c.minio.PresignedGetObject(ctx, c.bucketName, objectKey, c.presignTTL, nil)
+}
+
+func (c *Client) PutObject(ctx context.Context, objectKey string, reader io.Reader, size int64, mimeType string) error {
+	_, err := c.minio.PutObject(ctx, c.bucketName, objectKey, reader, size, minio.PutObjectOptions{
+		ContentType: mimeType,
+	})
+	return err
+}
+
+func (c *Client) GetObject(ctx context.Context, objectKey string) (io.ReadCloser, error) {
+	object, err := c.minio.GetObject(ctx, c.bucketName, objectKey, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := object.Stat(); err != nil {
+		_ = object.Close()
+		return nil, err
+	}
+	return object, nil
 }
 
 func (c *Client) RemoveObject(ctx context.Context, objectKey string) error {

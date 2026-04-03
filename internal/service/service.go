@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"strings"
@@ -55,6 +56,8 @@ type ObjectStore interface {
 	EnsureBucket(ctx context.Context) error
 	PresignedPut(ctx context.Context, objectKey string, mimeType string) (*url.URL, error)
 	PresignedGet(ctx context.Context, objectKey string) (*url.URL, error)
+	PutObject(ctx context.Context, objectKey string, reader io.Reader, size int64, mimeType string) error
+	GetObject(ctx context.Context, objectKey string) (io.ReadCloser, error)
 	RemoveObject(ctx context.Context, objectKey string) error
 	Health(ctx context.Context) error
 }
@@ -356,14 +359,7 @@ func (s *Service) AttachmentDownloadURL(ctx context.Context, deviceID, attachmen
 	if s.objects == nil {
 		return domain.Attachment{}, "", errors.New("object store is not configured")
 	}
-	allowed, err := s.store.CanAccessAttachment(ctx, attachmentID, deviceID)
-	if err != nil {
-		return domain.Attachment{}, "", err
-	}
-	if !allowed {
-		return domain.Attachment{}, "", ErrUnauthorized
-	}
-	attachment, err := s.store.GetAttachment(ctx, attachmentID)
+	attachment, err := s.GetAccessibleAttachment(ctx, deviceID, attachmentID)
 	if err != nil {
 		return domain.Attachment{}, "", err
 	}
@@ -376,6 +372,74 @@ func (s *Service) AttachmentDownloadURL(ctx context.Context, deviceID, attachmen
 		"attachment_id": attachmentID,
 	})
 	return attachment, url.String(), nil
+}
+
+func (s *Service) GetOwnedAttachment(ctx context.Context, deviceID, attachmentID string) (domain.Attachment, error) {
+	if s.objects == nil {
+		return domain.Attachment{}, errors.New("object store is not configured")
+	}
+	attachment, err := s.store.GetAttachment(ctx, attachmentID)
+	if err != nil {
+		return domain.Attachment{}, err
+	}
+	if attachment.DeviceID != deviceID {
+		return domain.Attachment{}, ErrUnauthorized
+	}
+	return attachment, nil
+}
+
+func (s *Service) GetAccessibleAttachment(ctx context.Context, deviceID, attachmentID string) (domain.Attachment, error) {
+	if s.objects == nil {
+		return domain.Attachment{}, errors.New("object store is not configured")
+	}
+	allowed, err := s.store.CanAccessAttachment(ctx, attachmentID, deviceID)
+	if err != nil {
+		return domain.Attachment{}, err
+	}
+	if !allowed {
+		return domain.Attachment{}, ErrUnauthorized
+	}
+	return s.store.GetAttachment(ctx, attachmentID)
+}
+
+func (s *Service) UploadAttachmentContent(ctx context.Context, deviceID, attachmentID, mimeType string, size int64, body io.Reader) (domain.Attachment, error) {
+	attachment, err := s.GetOwnedAttachment(ctx, deviceID, attachmentID)
+	if err != nil {
+		return domain.Attachment{}, err
+	}
+	if size <= 0 || size != attachment.CiphertextSize {
+		return domain.Attachment{}, fmt.Errorf("%w: attachment size mismatch", ErrInvalidInput)
+	}
+	if mimeType != "" && mimeType != attachment.MIMEType {
+		return domain.Attachment{}, fmt.Errorf("%w: attachment mime type mismatch", ErrInvalidInput)
+	}
+	if err := s.objects.PutObject(ctx, attachment.ObjectKey, body, size, attachment.MIMEType); err != nil {
+		return domain.Attachment{}, err
+	}
+	s.logEvent(slog.LevelInfo, "attachment uploaded", map[string]any{
+		"device_id":       deviceID,
+		"attachment_id":   attachment.ID,
+		"ciphertext_size": attachment.CiphertextSize,
+		"mime_type":       attachment.MIMEType,
+	})
+	return attachment, nil
+}
+
+func (s *Service) OpenAttachmentContent(ctx context.Context, deviceID, attachmentID string) (domain.Attachment, io.ReadCloser, error) {
+	attachment, err := s.GetAccessibleAttachment(ctx, deviceID, attachmentID)
+	if err != nil {
+		return domain.Attachment{}, nil, err
+	}
+	reader, err := s.objects.GetObject(ctx, attachment.ObjectKey)
+	if err != nil {
+		return domain.Attachment{}, nil, err
+	}
+	s.logEvent(slog.LevelInfo, "attachment streamed", map[string]any{
+		"device_id":     deviceID,
+		"attachment_id": attachment.ID,
+		"mime_type":     attachment.MIMEType,
+	})
+	return attachment, reader, nil
 }
 
 func (s *Service) CleanupExpired(ctx context.Context) error {

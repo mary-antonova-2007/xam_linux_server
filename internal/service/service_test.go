@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -179,6 +180,13 @@ func (f *fakeObjectStore) PresignedPut(ctx context.Context, objectKey string, mi
 }
 func (f *fakeObjectStore) PresignedGet(ctx context.Context, objectKey string) (*url.URL, error) {
 	return url.Parse("https://example.invalid/download/" + objectKey)
+}
+func (f *fakeObjectStore) PutObject(ctx context.Context, objectKey string, reader io.Reader, size int64, mimeType string) error {
+	_, err := io.ReadAll(reader)
+	return err
+}
+func (f *fakeObjectStore) GetObject(ctx context.Context, objectKey string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader([]byte("payload"))), nil
 }
 
 func newTestService(t *testing.T) (*Service, ed25519.PrivateKey, domain.Device) {

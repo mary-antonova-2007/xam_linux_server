@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -59,7 +61,9 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /messages/pull", s.withAuth(s.handlePullMessages))
 	mux.Handle("POST /messages/ack-delete", s.withAuth(s.handleAckDelete))
 	mux.Handle("POST /attachments/upload-init", s.withAuth(s.handleUploadInit))
+	mux.Handle("PUT /attachments/upload", s.withAuth(s.handleAttachmentUpload))
 	mux.Handle("GET /attachments/download", s.withAuth(s.handleDownloadAttachment))
+	mux.Handle("GET /attachments/content", s.withAuth(s.handleAttachmentContent))
 	if s.cfg.DebugAPIEnabled {
 		mux.HandleFunc("POST /debug/bootstrap", s.handleDebugBootstrap)
 		mux.HandleFunc("POST /debug/resolve-device", s.handleDebugResolveDevice)
@@ -216,8 +220,42 @@ func (s *Server) handleUploadInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
+		"attachment":        attachment,
+		"upload_url":        s.absoluteURL(r, "/attachments/upload?attachment_id="+url.QueryEscape(attachment.ID)),
+		"direct_upload_url": uploadURL,
+	})
+}
+
+func (s *Server) handleAttachmentUpload(w http.ResponseWriter, r *http.Request) {
+	deviceID := deviceIDFromContext(r.Context())
+	if !s.sendLimiter.Allow(deviceID, time.Now()) {
+		s.writeError(w, http.StatusTooManyRequests, service.ErrRateLimited)
+		return
+	}
+	attachmentID := r.URL.Query().Get("attachment_id")
+	if attachmentID == "" {
+		s.writeError(w, http.StatusBadRequest, errors.New("attachment_id is required"))
+		return
+	}
+	if r.ContentLength <= 0 {
+		s.writeError(w, http.StatusBadRequest, fmt.Errorf("%w: content-length is required", service.ErrInvalidInput))
+		return
+	}
+	attachment, err := s.service.UploadAttachmentContent(
+		r.Context(),
+		deviceID,
+		attachmentID,
+		r.Header.Get("Content-Type"),
+		r.ContentLength,
+		r.Body,
+	)
+	if err != nil {
+		s.writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
 		"attachment": attachment,
-		"upload_url": uploadURL,
+		"uploaded":   true,
 	})
 }
 
@@ -228,15 +266,42 @@ func (s *Server) handleDownloadAttachment(w http.ResponseWriter, r *http.Request
 		s.writeError(w, http.StatusBadRequest, errors.New("attachment_id is required"))
 		return
 	}
-	attachment, downloadURL, err := s.service.AttachmentDownloadURL(r.Context(), deviceID, attachmentID)
+	attachment, err := s.service.GetAccessibleAttachment(r.Context(), deviceID, attachmentID)
 	if err != nil {
 		s.writeServiceError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"attachment":   attachment,
-		"download_url": downloadURL,
+		"download_url": s.absoluteURL(r, "/attachments/content?attachment_id="+url.QueryEscape(attachmentID)),
 	})
+}
+
+func (s *Server) handleAttachmentContent(w http.ResponseWriter, r *http.Request) {
+	deviceID := deviceIDFromContext(r.Context())
+	attachmentID := r.URL.Query().Get("attachment_id")
+	if attachmentID == "" {
+		s.writeError(w, http.StatusBadRequest, errors.New("attachment_id is required"))
+		return
+	}
+	attachment, reader, err := s.service.OpenAttachmentContent(r.Context(), deviceID, attachmentID)
+	if err != nil {
+		s.writeServiceError(w, err)
+		return
+	}
+	defer reader.Close()
+
+	if attachment.MIMEType != "" {
+		w.Header().Set("Content-Type", attachment.MIMEType)
+	}
+	if attachment.CiphertextSize > 0 {
+		w.Header().Set("Content-Length", strconv.FormatInt(attachment.CiphertextSize, 10))
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.Copy(w, reader); err != nil {
+		s.logger.Warn("attachment stream failed", "attachment_id", attachment.ID, "device_id", deviceID, "error", err)
+	}
 }
 
 func (s *Server) handleDebugBootstrap(w http.ResponseWriter, r *http.Request) {
@@ -410,6 +475,16 @@ func clientKey(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func (s *Server) absoluteURL(r *http.Request, path string) string {
+	scheme := "http"
+	if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded != "" {
+		scheme = forwarded
+	} else if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host + path
 }
 
 type statusRecorder struct {
