@@ -19,6 +19,22 @@ cp .env.server.example .env
 docker compose --env-file .env up -d --build
 ```
 
+## Interactive deployment helper
+
+Instead of filling `.env` manually, you can run:
+
+```bash
+chmod +x scripts/deploy.sh
+./scripts/deploy.sh
+```
+
+The script:
+
+- asks for bind address, port, database credentials, JWT secret, and MinIO credentials
+- generates strong defaults for secrets
+- writes a ready-to-use `.env`
+- can immediately run `docker compose --env-file .env up -d --build`
+
 ## Health check
 
 ```bash

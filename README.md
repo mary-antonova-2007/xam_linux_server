@@ -29,6 +29,17 @@ The server does not decrypt payloads and does not inspect attachment contents.
 docker compose up --build
 ```
 
+## Guided deploy setup
+
+For a first self-hosted deployment you can use the interactive helper:
+
+```bash
+chmod +x scripts/deploy.sh
+./scripts/deploy.sh
+```
+
+It generates `.env` for you and can start Docker automatically.
+
 Server:
 
 - API: `http://localhost:8080`
