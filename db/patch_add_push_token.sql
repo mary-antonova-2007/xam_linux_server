@@ -1,0 +1,2 @@
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_updated_at TIMESTAMPTZ;

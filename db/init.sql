@@ -2,10 +2,15 @@ CREATE TABLE IF NOT EXISTS devices (
     device_id TEXT PRIMARY KEY,
     auth_public_key TEXT NOT NULL UNIQUE,
     exchange_public_key TEXT NOT NULL UNIQUE,
+    push_token TEXT,
+    push_token_updated_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
     last_seen_at TIMESTAMPTZ NOT NULL,
     status TEXT NOT NULL
 );
+
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token TEXT;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS push_token_updated_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS auth_challenges (
     challenge_id TEXT PRIMARY KEY,

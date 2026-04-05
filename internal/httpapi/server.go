@@ -57,6 +57,7 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("POST /devices/register", s.handleRegister)
 	mux.HandleFunc("POST /auth/challenge", s.handleChallenge)
 	mux.HandleFunc("POST /auth/verify", s.handleVerify)
+	mux.Handle("PUT /devices/push-token", s.withAuth(s.handleUpdatePushToken))
 	mux.Handle("POST /messages", s.withAuth(s.handleSendMessage))
 	mux.Handle("GET /messages/pull", s.withAuth(s.handlePullMessages))
 	mux.Handle("POST /messages/ack-delete", s.withAuth(s.handleAckDelete))
@@ -163,6 +164,20 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, message)
+}
+
+func (s *Server) handleUpdatePushToken(w http.ResponseWriter, r *http.Request) {
+	deviceID := deviceIDFromContext(r.Context())
+	var input service.UpdatePushTokenInput
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		s.writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.service.UpdatePushToken(r.Context(), deviceID, input); err != nil {
+		s.writeServiceError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": true})
 }
 
 func (s *Server) handlePullMessages(w http.ResponseWriter, r *http.Request) {

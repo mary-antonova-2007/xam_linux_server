@@ -16,6 +16,7 @@ import (
 	"xam/linux_server/internal/auth"
 	"xam/linux_server/internal/config"
 	"xam/linux_server/internal/domain"
+	"xam/linux_server/internal/push"
 	"xam/linux_server/internal/storage"
 )
 
@@ -83,6 +84,21 @@ func (m *memoryStore) TouchDevice(ctx context.Context, deviceID string, now time
 		return storage.ErrNotFound
 	}
 	device.LastSeenAt = now
+	m.devices[deviceID] = device
+	return nil
+}
+
+func (m *memoryStore) UpdateDevicePushToken(ctx context.Context, deviceID, pushToken string, updatedAt time.Time) error {
+	device, ok := m.devices[deviceID]
+	if !ok {
+		return storage.ErrNotFound
+	}
+	device.PushToken = pushToken
+	if pushToken == "" {
+		device.PushTokenUpdatedAt = nil
+	} else {
+		device.PushTokenUpdatedAt = &updatedAt
+	}
 	m.devices[deviceID] = device
 	return nil
 }
@@ -189,7 +205,47 @@ func (f *fakeObjectStore) GetObject(ctx context.Context, objectKey string) (io.R
 	return io.NopCloser(bytes.NewReader([]byte("payload"))), nil
 }
 
-func newTestService(t *testing.T) (*Service, ed25519.PrivateKey, domain.Device) {
+type fakePushSender struct {
+	tokens []string
+	err    error
+}
+
+func (f *fakePushSender) SendActivity(ctx context.Context, pushToken string) error {
+	f.tokens = append(f.tokens, pushToken)
+	return f.err
+}
+
+func TestInitAttachmentUploadAcceptsAnyMime(t *testing.T) {
+	svc, _, _, device := newTestService(t)
+
+	attachment, _, err := svc.InitAttachmentUpload(context.Background(), device.ID, UploadInitInput{
+		CiphertextSize: 1024,
+		MIMEType:       "audio/mpeg",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.MIMEType != "audio/mpeg" {
+		t.Fatalf("expected audio/mpeg, got %s", attachment.MIMEType)
+	}
+}
+
+func TestInitAttachmentUploadDefaultsMimeType(t *testing.T) {
+	svc, _, _, device := newTestService(t)
+
+	attachment, _, err := svc.InitAttachmentUpload(context.Background(), device.ID, UploadInitInput{
+		CiphertextSize: 1024,
+		MIMEType:       "",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attachment.MIMEType != "application/octet-stream" {
+		t.Fatalf("expected application/octet-stream, got %s", attachment.MIMEType)
+	}
+}
+
+func newTestService(t *testing.T) (*Service, *fakePushSender, ed25519.PrivateKey, domain.Device) {
 	t.Helper()
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -211,7 +267,8 @@ func newTestService(t *testing.T) (*Service, ed25519.PrivateKey, domain.Device) 
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	tokens := auth.NewTokenManager("test-secret", cfg.TokenTTL)
-	svc := New(cfg, store, &fakeObjectStore{}, tokens, logger, nil)
+	pushSender := &fakePushSender{}
+	svc := New(cfg, store, &fakeObjectStore{}, tokens, pushSender, logger, nil)
 	device, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{
 		AuthPublicKey:     authKey,
 		ExchangePublicKey: exchangeKey,
@@ -219,11 +276,11 @@ func newTestService(t *testing.T) (*Service, ed25519.PrivateKey, domain.Device) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	return svc, priv, device
+	return svc, pushSender, priv, device
 }
 
 func TestVerifyChallenge(t *testing.T) {
-	svc, priv, device := newTestService(t)
+	svc, _, priv, device := newTestService(t)
 	challenge, err := svc.CreateChallenge(context.Background(), CreateChallengeInput{AuthPublicKey: device.AuthPublicKey})
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +306,7 @@ func TestVerifyChallenge(t *testing.T) {
 }
 
 func TestMessageLifecycleAndIdempotency(t *testing.T) {
-	svc, _, sender := newTestService(t)
+	svc, _, _, sender := newTestService(t)
 	recipient, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{
 		AuthPublicKey:     base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32)),
 		ExchangePublicKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32)),
@@ -295,5 +352,83 @@ func TestMessageLifecycleAndIdempotency(t *testing.T) {
 	}
 	if len(messages) != 0 {
 		t.Fatalf("expected 0 messages after ack, got %d", len(messages))
+	}
+}
+
+func TestUpdatePushToken(t *testing.T) {
+	svc, _, _, device := newTestService(t)
+	err := svc.UpdatePushToken(context.Background(), device.ID, UpdatePushTokenInput{
+		PushToken: "push-token-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := svc.store.GetDeviceByID(context.Background(), device.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PushToken != "push-token-1" {
+		t.Fatalf("expected push token to be stored, got %q", updated.PushToken)
+	}
+}
+
+func TestSendMessageTriggersPushActivity(t *testing.T) {
+	svc, pushSender, _, sender := newTestService(t)
+	recipient, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{
+		AuthPublicKey:     base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32)),
+		ExchangePublicKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{4}, 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdatePushToken(context.Background(), recipient.ID, UpdatePushTokenInput{PushToken: "push-recipient"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = svc.SendMessage(context.Background(), sender.ID, SendMessageInput{
+		RecipientDeviceID: recipient.ID,
+		Ciphertext:        base64.StdEncoding.EncodeToString([]byte("ciphertext")),
+		Nonce:             base64.StdEncoding.EncodeToString([]byte("nonce")),
+		MessageType:       "text",
+		IdempotencyKey:    "idem-push",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pushSender.tokens) != 1 || pushSender.tokens[0] != "push-recipient" {
+		t.Fatalf("expected one push activity for recipient, got %#v", pushSender.tokens)
+	}
+}
+
+func TestInvalidPushTokenGetsCleared(t *testing.T) {
+	svc, pushSender, _, sender := newTestService(t)
+	pushSender.err = push.ErrPushTokenInvalid
+	recipient, err := svc.RegisterDevice(context.Background(), RegisterDeviceInput{
+		AuthPublicKey:     base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{5}, 32)),
+		ExchangePublicKey: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{6}, 32)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.UpdatePushToken(context.Background(), recipient.ID, UpdatePushTokenInput{PushToken: "stale-push"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = svc.SendMessage(context.Background(), sender.ID, SendMessageInput{
+		RecipientDeviceID: recipient.ID,
+		Ciphertext:        base64.StdEncoding.EncodeToString([]byte("ciphertext")),
+		Nonce:             base64.StdEncoding.EncodeToString([]byte("nonce")),
+		MessageType:       "text",
+		IdempotencyKey:    "idem-stale-push",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := svc.store.GetDeviceByID(context.Background(), recipient.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PushToken != "" {
+		t.Fatalf("expected invalid push token to be cleared, got %q", updated.PushToken)
 	}
 }

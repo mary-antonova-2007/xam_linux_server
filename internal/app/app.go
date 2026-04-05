@@ -12,6 +12,7 @@ import (
 	"xam/linux_server/internal/debuglog"
 	"xam/linux_server/internal/httpapi"
 	"xam/linux_server/internal/objectstore"
+	"xam/linux_server/internal/push"
 	"xam/linux_server/internal/service"
 	"xam/linux_server/internal/storage"
 )
@@ -45,7 +46,12 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 
 	tokens := auth.NewTokenManager(cfg.JWTSecret, cfg.TokenTTL)
 	logbook := debuglog.New(cfg.DebugLogBuffer)
-	svc := service.New(cfg, store, objects, tokens, logger, logbook)
+	pushSender, err := push.New(cfg, logger)
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	svc := service.New(cfg, store, objects, tokens, pushSender, logger, logbook)
 	server := httpapi.New(cfg, logger, svc, tokens, logbook)
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/url"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"xam/linux_server/internal/config"
 	"xam/linux_server/internal/debuglog"
 	"xam/linux_server/internal/domain"
+	"xam/linux_server/internal/push"
 	"xam/linux_server/internal/storage"
 )
 
@@ -50,6 +52,7 @@ type Store interface {
 	ListExpiredAttachments(ctx context.Context, now time.Time) ([]domain.Attachment, error)
 	DeleteAttachment(ctx context.Context, attachmentID string) error
 	Health(ctx context.Context) error
+	UpdateDevicePushToken(ctx context.Context, deviceID, pushToken string, updatedAt time.Time) error
 }
 
 type ObjectStore interface {
@@ -69,6 +72,7 @@ type Service struct {
 	store   Store
 	objects ObjectStore
 	tokens  *auth.TokenManager
+	push    push.Sender
 	logger  *slog.Logger
 	logbook *debuglog.LogBook
 	now     Clock
@@ -102,12 +106,20 @@ type UploadInitInput struct {
 	MIMEType       string `json:"mime_type"`
 }
 
-func New(cfg config.Config, store Store, objects ObjectStore, tokens *auth.TokenManager, logger *slog.Logger, logbook *debuglog.LogBook) *Service {
+type UpdatePushTokenInput struct {
+	PushToken string `json:"push_token"`
+}
+
+func New(cfg config.Config, store Store, objects ObjectStore, tokens *auth.TokenManager, pushSender push.Sender, logger *slog.Logger, logbook *debuglog.LogBook) *Service {
+	if pushSender == nil {
+		pushSender = push.NoopSender{}
+	}
 	return &Service{
 		cfg:     cfg,
 		store:   store,
 		objects: objects,
 		tokens:  tokens,
+		push:    pushSender,
 		logger:  logger,
 		logbook: logbook,
 		now:     time.Now,
@@ -237,7 +249,8 @@ func (s *Service) SendMessage(ctx context.Context, senderDeviceID string, input 
 		return domain.Message{}, fmt.Errorf("%w: invalid message type", ErrInvalidInput)
 	}
 
-	if _, err := s.store.GetDeviceByID(ctx, input.RecipientDeviceID); err != nil {
+	recipient, err := s.store.GetDeviceByID(ctx, input.RecipientDeviceID)
+	if err != nil {
 		return domain.Message{}, fmt.Errorf("%w: recipient not found", ErrInvalidInput)
 	}
 
@@ -277,7 +290,24 @@ func (s *Service) SendMessage(ctx context.Context, senderDeviceID string, input 
 		"has_attachment":       input.AttachmentID != nil,
 		"idempotency_key_size": len(input.IdempotencyKey),
 	})
+	s.notifyRecipient(ctx, recipient)
 	return created, nil
+}
+
+func (s *Service) UpdatePushToken(ctx context.Context, deviceID string, input UpdatePushTokenInput) error {
+	pushToken := strings.TrimSpace(input.PushToken)
+	if len(pushToken) > 4096 {
+		return fmt.Errorf("%w: invalid push token", ErrInvalidInput)
+	}
+	if err := s.store.UpdateDevicePushToken(ctx, deviceID, pushToken, s.now().UTC()); err != nil {
+		return err
+	}
+	s.logEvent(slog.LevelInfo, "device push token updated", map[string]any{
+		"device_id":      deviceID,
+		"push_enabled":   pushToken != "",
+		"push_token_len": len(pushToken),
+	})
+	return nil
 }
 
 func (s *Service) PullMessages(ctx context.Context, deviceID string, limit int) ([]domain.Message, error) {
@@ -325,7 +355,8 @@ func (s *Service) InitAttachmentUpload(ctx context.Context, deviceID string, inp
 	if input.CiphertextSize <= 0 || input.CiphertextSize > s.cfg.MaxAttachmentBytes {
 		return domain.Attachment{}, "", fmt.Errorf("%w: invalid attachment size", ErrInvalidInput)
 	}
-	if !isAllowedMIME(input.MIMEType) {
+	normalizedMIME, err := normalizeAttachmentMIME(input.MIMEType)
+	if err != nil {
 		return domain.Attachment{}, "", fmt.Errorf("%w: unsupported mime type", ErrInvalidInput)
 	}
 	now := s.now().UTC()
@@ -334,11 +365,11 @@ func (s *Service) InitAttachmentUpload(ctx context.Context, deviceID string, inp
 		DeviceID:       deviceID,
 		ObjectKey:      fmt.Sprintf("%s/%s", deviceID, uuid.NewString()),
 		CiphertextSize: input.CiphertextSize,
-		MIMEType:       input.MIMEType,
+		MIMEType:       normalizedMIME,
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(s.cfg.MessageTTL),
 	}
-	attachment, err := s.store.CreateAttachment(ctx, attachment)
+	attachment, err = s.store.CreateAttachment(ctx, attachment)
 	if err != nil {
 		return domain.Attachment{}, "", err
 	}
@@ -410,8 +441,14 @@ func (s *Service) UploadAttachmentContent(ctx context.Context, deviceID, attachm
 	if size <= 0 || size != attachment.CiphertextSize {
 		return domain.Attachment{}, fmt.Errorf("%w: attachment size mismatch", ErrInvalidInput)
 	}
-	if mimeType != "" && mimeType != attachment.MIMEType {
-		return domain.Attachment{}, fmt.Errorf("%w: attachment mime type mismatch", ErrInvalidInput)
+	if mimeType != "" {
+		normalizedMIME, err := normalizeAttachmentMIME(mimeType)
+		if err != nil {
+			return domain.Attachment{}, fmt.Errorf("%w: attachment mime type mismatch", ErrInvalidInput)
+		}
+		if normalizedMIME != attachment.MIMEType {
+			return domain.Attachment{}, fmt.Errorf("%w: attachment mime type mismatch", ErrInvalidInput)
+		}
 	}
 	if err := s.objects.PutObject(ctx, attachment.ObjectKey, body, size, attachment.MIMEType); err != nil {
 		return domain.Attachment{}, err
@@ -559,6 +596,22 @@ func (s *Service) logEvent(level slog.Level, message string, fields map[string]a
 	}
 }
 
+func (s *Service) notifyRecipient(ctx context.Context, recipient domain.Device) {
+	if strings.TrimSpace(recipient.PushToken) == "" {
+		return
+	}
+	if err := s.push.SendActivity(ctx, recipient.PushToken); err != nil {
+		if errors.Is(err, push.ErrPushTokenInvalid) {
+			if clearErr := s.store.UpdateDevicePushToken(ctx, recipient.ID, "", s.now().UTC()); clearErr != nil {
+				s.logger.Warn("failed to clear invalid push token", "device_id", recipient.ID, "error", clearErr)
+			}
+			s.logger.Info("invalid push token cleared", "device_id", recipient.ID)
+			return
+		}
+		s.logger.Warn("push activity send failed", "device_id", recipient.ID, "error", err)
+	}
+}
+
 func validateBase64Key(value string) error {
 	decoded, err := base64.StdEncoding.DecodeString(value)
 	if err != nil || len(decoded) == 0 {
@@ -584,13 +637,20 @@ func isAllowedMessageType(value string) bool {
 	}
 }
 
-func isAllowedMIME(value string) bool {
-	if value == "" || len(value) > 255 {
-		return false
+func normalizeAttachmentMIME(value string) (string, error) {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return "application/octet-stream", nil
 	}
-	value = strings.ToLower(value)
-	return strings.HasPrefix(value, "image/") ||
-		strings.HasPrefix(value, "video/") ||
-		strings.HasPrefix(value, "application/") ||
-		strings.HasPrefix(value, "text/")
+	if len(value) > 255 {
+		return "", ErrInvalidInput
+	}
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		return "", err
+	}
+	if mediaType == "" || !strings.Contains(mediaType, "/") {
+		return "", ErrInvalidInput
+	}
+	return mediaType, nil
 }

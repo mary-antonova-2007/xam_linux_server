@@ -45,13 +45,15 @@ func (s *PostgresStore) CreateDevice(ctx context.Context, authKey, exchangeKey s
 	query := `
 		INSERT INTO devices (device_id, auth_public_key, exchange_public_key, created_at, last_seen_at, status)
 		VALUES ($1, $2, $3, $4, $4, 'active')
-		RETURNING device_id, auth_public_key, exchange_public_key, created_at, last_seen_at, status
+		RETURNING device_id, auth_public_key, exchange_public_key, push_token, push_token_updated_at, created_at, last_seen_at, status
 	`
 	var device domain.Device
 	err := s.db.QueryRowContext(ctx, query, deviceID, authKey, exchangeKey, now).Scan(
 		&device.ID,
 		&device.AuthPublicKey,
 		&device.ExchangePublicKey,
+		&device.PushToken,
+		&device.PushTokenUpdatedAt,
 		&device.CreatedAt,
 		&device.LastSeenAt,
 		&device.Status,
@@ -64,7 +66,7 @@ func (s *PostgresStore) CreateDevice(ctx context.Context, authKey, exchangeKey s
 
 func (s *PostgresStore) GetDeviceByID(ctx context.Context, deviceID string) (domain.Device, error) {
 	query := `
-		SELECT device_id, auth_public_key, exchange_public_key, created_at, last_seen_at, status
+		SELECT device_id, auth_public_key, exchange_public_key, push_token, push_token_updated_at, created_at, last_seen_at, status
 		FROM devices
 		WHERE device_id = $1
 	`
@@ -73,6 +75,8 @@ func (s *PostgresStore) GetDeviceByID(ctx context.Context, deviceID string) (dom
 		&device.ID,
 		&device.AuthPublicKey,
 		&device.ExchangePublicKey,
+		&device.PushToken,
+		&device.PushTokenUpdatedAt,
 		&device.CreatedAt,
 		&device.LastSeenAt,
 		&device.Status,
@@ -88,7 +92,7 @@ func (s *PostgresStore) GetDeviceByID(ctx context.Context, deviceID string) (dom
 
 func (s *PostgresStore) GetDeviceByAuthKey(ctx context.Context, authKey string) (domain.Device, error) {
 	query := `
-		SELECT device_id, auth_public_key, exchange_public_key, created_at, last_seen_at, status
+		SELECT device_id, auth_public_key, exchange_public_key, push_token, push_token_updated_at, created_at, last_seen_at, status
 		FROM devices
 		WHERE auth_public_key = $1
 	`
@@ -97,6 +101,8 @@ func (s *PostgresStore) GetDeviceByAuthKey(ctx context.Context, authKey string) 
 		&device.ID,
 		&device.AuthPublicKey,
 		&device.ExchangePublicKey,
+		&device.PushToken,
+		&device.PushTokenUpdatedAt,
 		&device.CreatedAt,
 		&device.LastSeenAt,
 		&device.Status,
@@ -112,6 +118,26 @@ func (s *PostgresStore) GetDeviceByAuthKey(ctx context.Context, authKey string) 
 
 func (s *PostgresStore) TouchDevice(ctx context.Context, deviceID string, now time.Time) error {
 	result, err := s.db.ExecContext(ctx, `UPDATE devices SET last_seen_at = $2 WHERE device_id = $1`, deviceID, now)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PostgresStore) UpdateDevicePushToken(ctx context.Context, deviceID, pushToken string, updatedAt time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE devices
+		SET push_token = $2,
+		    push_token_updated_at = CASE WHEN $2 = '' THEN NULL ELSE $3 END
+		WHERE device_id = $1
+	`, deviceID, pushToken, updatedAt)
 	if err != nil {
 		return err
 	}

@@ -33,6 +33,9 @@ type Config struct {
 	LogLevel           slog.Level
 	DebugAPIEnabled    bool
 	DebugLogBuffer     int
+	FCMProjectID       string
+	FCMCredentialsJSON string
+	FCMCredentialsFile string
 }
 
 func Load() (Config, error) {
@@ -61,6 +64,9 @@ func Load() (Config, error) {
 		LogLevel:           getLogLevel(getEnv("LOG_LEVEL", "INFO")),
 		DebugAPIEnabled:    getBoolEnv("DEBUG_API_ENABLED", false),
 		DebugLogBuffer:     getIntEnv("DEBUG_LOG_BUFFER", 500),
+		FCMProjectID:       getEnv("FCM_PROJECT_ID", ""),
+		FCMCredentialsJSON: getEnv("FCM_CREDENTIALS_JSON", ""),
+		FCMCredentialsFile: getEnv("FCM_CREDENTIALS_FILE", ""),
 	}
 
 	if cfg.JWTSecret == "" {

@@ -3,12 +3,14 @@ package domain
 import "time"
 
 type Device struct {
-	ID                string    `json:"device_id"`
-	AuthPublicKey     string    `json:"auth_public_key"`
-	ExchangePublicKey string    `json:"exchange_public_key"`
-	CreatedAt         time.Time `json:"created_at"`
-	LastSeenAt        time.Time `json:"last_seen_at"`
-	Status            string    `json:"status"`
+	ID                 string     `json:"device_id"`
+	AuthPublicKey      string     `json:"auth_public_key"`
+	ExchangePublicKey  string     `json:"exchange_public_key"`
+	PushToken          string     `json:"-"`
+	PushTokenUpdatedAt *time.Time `json:"-"`
+	CreatedAt          time.Time  `json:"created_at"`
+	LastSeenAt         time.Time  `json:"last_seen_at"`
+	Status             string     `json:"status"`
 }
 
 type Message struct {
