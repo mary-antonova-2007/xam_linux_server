@@ -135,7 +135,7 @@ func (s *PostgresStore) UpdateDevicePushToken(ctx context.Context, deviceID, pus
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE devices
 		SET push_token = $2,
-		    push_token_updated_at = CASE WHEN $2 = '' THEN NULL ELSE $3 END
+		    push_token_updated_at = CASE WHEN $2 = '' THEN NULL::timestamptz ELSE $3 END
 		WHERE device_id = $1
 	`, deviceID, pushToken, updatedAt)
 	if err != nil {
