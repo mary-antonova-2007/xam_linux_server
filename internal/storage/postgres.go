@@ -47,17 +47,7 @@ func (s *PostgresStore) CreateDevice(ctx context.Context, authKey, exchangeKey s
 		VALUES ($1, $2, $3, $4, $4, 'active')
 		RETURNING device_id, auth_public_key, exchange_public_key, push_token, push_token_updated_at, created_at, last_seen_at, status
 	`
-	var device domain.Device
-	err := s.db.QueryRowContext(ctx, query, deviceID, authKey, exchangeKey, now).Scan(
-		&device.ID,
-		&device.AuthPublicKey,
-		&device.ExchangePublicKey,
-		&device.PushToken,
-		&device.PushTokenUpdatedAt,
-		&device.CreatedAt,
-		&device.LastSeenAt,
-		&device.Status,
-	)
+	device, err := scanDeviceRow(s.db.QueryRowContext(ctx, query, deviceID, authKey, exchangeKey, now))
 	if err != nil {
 		return domain.Device{}, err
 	}
@@ -70,17 +60,7 @@ func (s *PostgresStore) GetDeviceByID(ctx context.Context, deviceID string) (dom
 		FROM devices
 		WHERE device_id = $1
 	`
-	var device domain.Device
-	err := s.db.QueryRowContext(ctx, query, deviceID).Scan(
-		&device.ID,
-		&device.AuthPublicKey,
-		&device.ExchangePublicKey,
-		&device.PushToken,
-		&device.PushTokenUpdatedAt,
-		&device.CreatedAt,
-		&device.LastSeenAt,
-		&device.Status,
-	)
+	device, err := scanDeviceRow(s.db.QueryRowContext(ctx, query, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Device{}, ErrNotFound
 	}
@@ -96,23 +76,36 @@ func (s *PostgresStore) GetDeviceByAuthKey(ctx context.Context, authKey string) 
 		FROM devices
 		WHERE auth_public_key = $1
 	`
-	var device domain.Device
-	err := s.db.QueryRowContext(ctx, query, authKey).Scan(
-		&device.ID,
-		&device.AuthPublicKey,
-		&device.ExchangePublicKey,
-		&device.PushToken,
-		&device.PushTokenUpdatedAt,
-		&device.CreatedAt,
-		&device.LastSeenAt,
-		&device.Status,
-	)
+	device, err := scanDeviceRow(s.db.QueryRowContext(ctx, query, authKey))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Device{}, ErrNotFound
 	}
 	if err != nil {
 		return domain.Device{}, err
 	}
+	return device, nil
+}
+
+type deviceRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanDeviceRow(row deviceRowScanner) (domain.Device, error) {
+	var device domain.Device
+	var pushToken sql.NullString
+	if err := row.Scan(
+		&device.ID,
+		&device.AuthPublicKey,
+		&device.ExchangePublicKey,
+		&pushToken,
+		&device.PushTokenUpdatedAt,
+		&device.CreatedAt,
+		&device.LastSeenAt,
+		&device.Status,
+	); err != nil {
+		return domain.Device{}, err
+	}
+	device.PushToken = pushToken.String
 	return device, nil
 }
 
